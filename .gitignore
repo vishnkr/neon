@@ -10,3 +10,9 @@
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+peer/peer1/audio.mp3
+peer/peer1/peer
+peer/peer2/peer
+peer/peer3/peer
+peer/peer4/peer
+server/server
