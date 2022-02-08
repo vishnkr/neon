@@ -21,13 +21,17 @@ import (
 )
 
 type Peer struct{
-	PeerId int
-	Addr net.TCPAddr
+	peerId int
+	addr net.TCPAddr
+	conn net.Conn
+	w    *bufio.Writer
+    sync.Mutex
 }
 
 type RequestType int
 const (
 	RegisterRequest RequestType = iota
+	FileContentRequest
 	FileListRequest
 	FileLocationsRequest
 	ChunkRegisterRequest
@@ -58,27 +62,45 @@ func performCmd(){
 const (
 	serverIP ="127.0.0.1"
 	serverPort = "8080"
-	maxBufferSize = 1024
+	maxBufferSize = 2048
 )
 
 
-/*func SendMessage(rType RequestType, content []byte,conn net.Conn){
-	
-}*/
+func (p *Peer) SendMessage(rType RequestType, header string,payload []byte) error{
+	var cmd string
+	switch rType{
+	case RegisterRequest:
+		cmd = "REG"
+		header = fmt.Sprintf("%s %s",p.addr.String(),header)
+		break
+	case FileChunkRequest:
+		cmd = "REGCH"
+		header = fmt.Sprintf("%s %s",p.addr.String(),header)
+		break
+	}
+	message:=fmt.Sprintf("%s %s\r\n%s",cmd,header,string(payload))
+	_,err := p.w.Write([]byte(message))
+	if err==nil{
+		err = p.w.Flush()
+	}
+	if err != nil {               
+		return err
+	}
+	return nil
+}
 
 
 
-func readShareFile(filepath string,conn net.Conn){
+func (p *Peer) readShareFile(filepath string){
 	f, err := os.Open(filepath)
 	if err != nil {
         log.Fatalf("unable to read file: %v", err)
     }
 	defer f.Close()
 	fstat,_:=f.Stat()
-	message:=fmt.Sprintf("REG %s %s ",getFileName(filepath),strconv.Itoa(int(fstat.Size())))
+	message:=fmt.Sprintf("%s %s",getFileName(filepath),strconv.Itoa(int(fstat.Size())))
     buf := make([]byte, maxBufferSize)
-	fmt.Println("registering",message)
-	conn.Write([]byte(message))
+	p.SendMessage(RegisterRequest,message,[]byte(""))
 	i:=0
 	for {
 		n,err:=f.Read(buf)
@@ -92,9 +114,9 @@ func readShareFile(filepath string,conn net.Conn){
 		println(i,n,buf)
 		i+=1
 		if n > 0 {
-			fmt.Println("sending",string(buf[:n]))
-			content:= fmt.Sprintf("REGCH %d %s ",n,string(buf[:n]))
-			conn.Write([]byte(content))
+	 		content:= fmt.Sprintf("%s %d",getFileName(filepath),n)
+			fmt.Println("sending",content)
+			p.SendMessage(FileChunkRequest,content,buf[:n])
 		} else{
 			break
 		}
@@ -105,19 +127,27 @@ func readShareFile(filepath string,conn net.Conn){
 func getFileName(path string) string{ return filepath.Base(path) }
 func main(){
 	args := os.Args[1:]
-	var self Peer= Peer{}
-	self.Addr= net.TCPAddr{IP:net.ParseIP(args[0])}
+	var selfPeer Peer= Peer{}
+	selfPeer.addr= net.TCPAddr{IP:net.ParseIP(args[0])}
 	port, err := strconv.Atoi(args[1])
 	if err!=nil{
 		fmt.Println("Can't use port",port)
 	}
+	selfPeer.addr.Port = port
 	conn,err := net.Dial("tcp",serverIP+":"+serverPort)
+	if err!=nil{
+		fmt.Printf("Server is not online - %v\n",err)
+		return
+	}
+	selfPeer.conn = conn
+	selfPeer.w = bufio.NewWriter(conn)
+	fmt.Println(selfPeer.addr.IP.String())
 	if len(args)>=3{
 		i:=2
 		
 		for _,file:=range(args[i:]){
 			fmt.Println("r",args,file)
-			readShareFile(file,conn)
+			selfPeer.readShareFile(file)
 		}
 	}
 	reader := bufio.NewScanner(os.Stdin)
@@ -134,7 +164,10 @@ func main(){
 			listFiles()
 		case "progress":
 			displayProgress()
+		default:
+			printUnknown(text[0])
 		}
+		
 		printRepl()
 	}
 
