@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 
 	//"ioutil"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/vbauerster/mpb/v7"
@@ -24,8 +26,22 @@ type Peer struct{
 	peerId int
 	addr net.TCPAddr
 	conn net.Conn
+	fileChunks *ChunkStore
 	w    *bufio.Writer
+	r    *bufio.Reader
     sync.Mutex
+}
+
+type ChunkStore struct{
+	fileToChunkId map[int][]int
+
+}
+
+type Chunk struct{
+	fileId int
+	size int
+	chunkId int //used to reconstruct files from a collection of chunks
+	data []byte
 }
 
 type RequestType int
@@ -62,30 +78,30 @@ func performCmd(){
 const (
 	serverIP ="127.0.0.1"
 	serverPort = "8080"
-	maxBufferSize = 2048
+	maxBufferSize = 1048576
+	maxChunkSize = 1048576 //1MB
 )
 
 
 func (p *Peer) SendMessage(rType RequestType, header string,payload []byte) error{
-	var cmd string
 	switch rType{
 	case RegisterRequest:
-		cmd = "REG"
-		header = fmt.Sprintf("%s %s",p.addr.String(),header)
+		header = fmt.Sprintf("REG %s %s",p.addr.String(),header)
 		break
 	case FileChunkRequest:
-		cmd = "REGCH"
-		header = fmt.Sprintf("%s %s",p.addr.String(),header)
+		header = fmt.Sprintf("REGCH %s %s",p.addr.String(),header)
+		break
+	case FileListRequest:
+		header = "FLIST"
 		break
 	}
-	message:=fmt.Sprintf("%s %s\r\n%s",cmd,header,string(payload))
+	message:=fmt.Sprintf("%s\r\n%s",header,string(payload))
+	fmt.Println("sending",string(message))
 	_,err := p.w.Write([]byte(message))
-	if err==nil{
-		err = p.w.Flush()
-	}
 	if err != nil {               
 		return err
 	}
+	err = p.w.Flush()
 	return nil
 }
 
@@ -115,8 +131,11 @@ func (p *Peer) readShareFile(filepath string){
 		i+=1
 		if n > 0 {
 	 		content:= fmt.Sprintf("%s %d",getFileName(filepath),n)
-			fmt.Println("sending",content)
-			p.SendMessage(FileChunkRequest,content,buf[:n])
+			err = p.SendMessage(FileChunkRequest,content,buf[:n])
+			if err!=nil{
+				fmt.Println(err)
+				break
+			}
 		} else{
 			break
 		}
@@ -141,12 +160,12 @@ func main(){
 	}
 	selfPeer.conn = conn
 	selfPeer.w = bufio.NewWriter(conn)
+	selfPeer.r = bufio.NewReader(conn)
 	fmt.Println(selfPeer.addr.IP.String())
 	if len(args)>=3{
 		i:=2
 		
 		for _,file:=range(args[i:]){
-			fmt.Println("r",args,file)
 			selfPeer.readShareFile(file)
 		}
 	}
@@ -161,9 +180,11 @@ func main(){
 		case "download":
 			downloadFile(text[1])
 		case "list":
-			listFiles()
+			selfPeer.listFiles()
 		case "progress":
 			displayProgress()
+		case "upload":
+			selfPeer.readShareFile(text[1])
 		default:
 			printUnknown(text[0])
 		}
@@ -177,8 +198,37 @@ func main(){
 
 func downloadFile(file string){}
 
-func listFiles(){
+func (p *Peer) listFiles(){
 	//make a FileList request to server
+	writer := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', tabwriter.AlignRight)
+	p.SendMessage(FileListRequest,"",[]byte(""))
+	//read response from buffer terminated by \n into buffered reader
+	_,_,err := p.r.ReadLine()
+	body,_,err:= p.r.ReadLine()
+	if err!=nil{
+		fmt.Println(err)
+	}
+	//fmt.Println("got response:",string(header),"bodY:",string(body))
+	bodySplit := bytes.Split(body,[]byte(" "))
+	bodySplit=bodySplit[:len(bodySplit)-1]
+	
+	if len(bodySplit)==0{
+		fmt.Println("No files present in the network")
+		return
+	}
+	fmt.Println("Files present in the network:",len(bodySplit))
+	fmt.Fprintln(writer,"FileID\tFilename\tSize(in bytes)")
+	for _,filedata := range bodySplit{
+		filedata = bytes.Trim(filedata,"")
+		if len(filedata)>0{
+			fileId, fName, size := bytes.Split(filedata,[]byte(":"))[0],bytes.Split(filedata,[]byte(":"))[1],bytes.Split(filedata,[]byte(":"))[2]
+			displayStr:=fmt.Sprintf("%s\t%s\t%s",string(fileId),string(fName),string(size))
+			fmt.Fprintln(writer,displayStr)
+		}
+	}
+	writer.Flush()
+
+
 }
 
 func displayProgress(){

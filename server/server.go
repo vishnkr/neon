@@ -4,9 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"log"
 	"net"
-	"os"
 	"strconv"
 	"sync"
 )
@@ -55,7 +53,7 @@ const (
 	FileChunkRequest
 	NoneType
 )
-const maxBufferSize = 2048
+//const maxBufferSize = 2048
 
 type Message struct{
 	reqType RequestType
@@ -72,15 +70,19 @@ type FileInfo struct{
 	fileID int
 	fname string
 	sizeInBytes int
+	totalChunks int //chunks 0 to totalChunks-1 will be present as keys in chunkLocations
+	chunkLocations map[int][]*Client //map chunkid to list of clients containing
 }
 
 type Client struct{
 	id int
 	conn net.Conn
+	reader *bufio.Reader
+	addr net.Addr
 	register   chan<- *Client
 }
 type Server struct{
-	clients []*Client
+	clients map[int]*Client
 	fileMap map[string]FileInfo
 	fileCount int
 }
@@ -91,7 +93,7 @@ func getNextandRemaining(buffer []byte,sep []byte) ([]byte,[]byte){
 	return cmd,rem
 }
 
-func (s Server) getFileName(fileId int )string{
+func (s *Server) getFileNameFromId(fileId int )string{
 	for k,v:=range s.fileMap{
 		if v.fileID==fileId{
 			return k
@@ -100,21 +102,24 @@ func (s Server) getFileName(fileId int )string{
 	return ""
 }
 
-func (s Server) handleConn(conn net.Conn){
+func (s *Server) handleConn(conn net.Conn){
 	defer wg.Done()
-	
+	client:= &Client{id:len(s.clients)+1,conn:conn}
 	r := bufio.NewReader(conn)
+	client.reader = r
+	s.clients[client.id] = client
 	i:=0
 	for {
 		fmt.Println("Loop:",i)
-		header, err := r.ReadBytes('\n')
+		if i==5{
+			break
+		}
+		header, err := client.reader.ReadBytes('\n')
 		fmt.Println("Parsing header",string(header),len(header),string(header))
 		
 		cmd,fileId,payloadSize := s.extractHeader(header)
-		fmt.Println("got cmd",cmd,"file",s.getFileName(fileId),payloadSize)
-		if payloadSize>0{
-			s.handleMessage(cmd,r,fileId,payloadSize)
-		}
+		fmt.Println("got cmd",cmd,"file",s.getFileNameFromId(fileId),payloadSize)
+		s.handleMessage(cmd,client,fileId,payloadSize)
 		if err!=nil{
 			fmt.Println("error",err)
 			break
@@ -125,8 +130,9 @@ func (s Server) handleConn(conn net.Conn){
 }
 
 func (s *Server) extractHeader(header []byte) (RequestType,int,int){
-	fmt.Println("header time")
+	
 	headerSplit:=bytes.Split(header,[]byte(" "))
+	fmt.Println("header time cmd:",string(header))
 	switch string(bytes.TrimSpace(headerSplit[0])) {
 	case "REG":
 		//senderAddr:= string(bytes.TrimSpace(headerSplit[1]))
@@ -141,42 +147,53 @@ func (s *Server) extractHeader(header []byte) (RequestType,int,int){
 		//senderAddr:= string(bytes.TrimSpace(headerSplit[1]))
 		fname := string(bytes.TrimSpace(headerSplit[2]))
 		chunkSize,_:= strconv.Atoi(string(bytes.TrimSpace(headerSplit[3])))
-		return ChunkRegisterRequest,s.fileMap[fname].fileID,chunkSize
+		fmt.Println("filename",fname,"has chunk size",string(headerSplit[3]))
+		return FileChunkRequest,s.fileMap[fname].fileID,chunkSize
+	case "FLIST":
+		return FileListRequest,0,0
+
 	}
+
+	
 	return NoneType,0,0
 }
-
-func (s Server) handleMessage(cmd RequestType,reader *bufio.Reader,fileId int,payloadSize int){
-	
-	//cmd,rem:= getNextandRemaining(readBuf,[]byte(" "))
-	/*cmd:=bytes.Split(readBuf,[]byte(" "))[0]
-	_,rem:=getNextandRemaining(readBuf,[]byte(" "))
-	fmt.Println("cmd",string(cmd),len(cmd))*/
+func (s Server) sendResponse(clientId int,message []byte){
+	s.clients[clientId].conn.Write(message)
+}
+func (s Server) handleMessage(cmd RequestType,client *Client,fileId int,payloadSize int){
 	readBuf := make([]byte, payloadSize)
-	n, _ := reader.Read(readBuf)
+	n, _ := client.reader.Read(readBuf)
 	fmt.Printf("--------BUFFER START------\n%d:%s-------BUFFER END------",n,string(readBuf))
 	switch cmd {
-	case ChunkRegisterRequest:
-		//fmt.Print("REGCH message:", string(rem))
-		//header,rem:= getNextandRemaining(rem,[]byte(" "))//bytes.Split(rem, []byte(" "))
-		//headerSplit:= bytes.Split(header,[]byte(":"))
-		//fname:=string(bytes.TrimSpace(headerSplit[0]))
-		/*contentsize,err := strconv.Atoi(string(bytes.TrimSpace(headerSplit[1])))
-		if err!=nil{
-			log.Println(err)
-		}*/
-		content:= readBuf[:payloadSize]
-		fmt.Println("cont",string(content),s.getFileName(fileId))
-		f, err := os.OpenFile(s.getFileName(fileId),os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	case FileChunkRequest:
+		/*
+		totalRead := 0
+		f, err := os.OpenFile(s.getFileNameFromId(fileId),os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			log.Println(err)
 		}
 		defer f.Close()
-		if _, err := f.Write(content); err != nil {
-			log.Println(err)
+		for totalRead<payloadSize{
+			content:= readBuf[:n]
+			totalRead+=n
+			fmt.Println("cont",string(content),s.getFileNameFromId(fileId))
+			if _, err := f.Write(content); err != nil {
+				log.Println(err)
+			}
+			fmt.Println("buffer after regch: ",totalRead,payloadSize)
+			n, _ = reader.Read(readBuf)
+			if n==0{
+				break
+			}
+		}*/
+	case FileListRequest:
+		response:= fmt.Sprintf("FLIST %d\r\n",len(s.fileMap))
+		for _,file := range s.fileMap{
+			response+=fmt.Sprintf("%d:%s:%d ",file.fileID,file.fname,file.sizeInBytes)
 		}
-		defer f.Close()
-		fmt.Println("buffer after regch: ",string(readBuf))
+		fmt.Print("sending flist:",response)
+		s.sendResponse(client.id,[]byte(response+"\r\n"))
+
 	}
 }
 var wg sync.WaitGroup
@@ -189,18 +206,17 @@ const (
 func main(){
 	fmt.Printf("Welcome! The server is running at port %d\n",connPort)
 	var address = fmt.Sprintf("%s:%d",connIP,connPort)
-	var server Server = Server{fileMap:make(map[string]FileInfo),fileCount: 0}
-	listener, _ := net.Listen("tcp", address)	
+	var server Server = Server{fileMap:make(map[string]FileInfo),fileCount: 0,clients:make(map[int]*Client)}
+	listener, _ := net.Listen("tcp", address)
 	for{
+		
 		conn, err := listener.Accept()
+		fmt.Println("new client")
 		if err != nil {
 			fmt.Println("Error connecting:", err.Error())
-			return
 		}
 		wg.Add(1)
 		go server.handleConn(conn)
-		wg.Wait()
 	}
-	
 	
 }
