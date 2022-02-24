@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	//"ioutil"
+
 	"io"
 	"log"
 	"math/rand"
@@ -54,8 +55,17 @@ const (
 	FileChunkRequest
 )
 
+const (
+	serverIP      = "127.0.0.1"
+	serverPort    = "8080"
+	maxBufferSize = 1048576
+	maxChunkSize  = 1048576 //1MB
+)
+
+var wg sync.WaitGroup
+
 func displayHelpPrompt() {
-	fmt.Print("Welcome to Neon Peer CLI!!\nUse the following commands to view/download files:\n\t1) list - list all files available to download \n\t2) download <file-id> - download file from network \n\t3) progress - view active download progress\n\t4) help - view available commands\n")
+	fmt.Print("Welcome to Neon Peer CLI!!\nUse the following commands to view/download files:\n\t1) list - list all files available to download \n\t2) download <file-id> - download file from network \n\t3) upload <filepath> - upload file to network\n\t4) progress - view active download progress\n\t5) help - view available commands\n")
 }
 
 func printRepl() {
@@ -71,45 +81,54 @@ func stripInput(txt string) string {
 	return output
 }
 
-const (
-	serverIP      = "127.0.0.1"
-	serverPort    = "8080"
-	maxBufferSize = 1048576
-	maxChunkSize  = 1048576 //1MB
-)
-
 func (p *Peer) SendMessage(rType RequestType, header string, payload []byte) error {
 	switch rType {
 	case RegisterRequest:
 		header = fmt.Sprintf("REG %s %s", p.addr.String(), header)
 		break
 	case FileChunkRequest:
-		header = fmt.Sprintf("REGCH %s %s", p.addr.String(), header)
+		header = fmt.Sprintf("FCHNK %s %s", p.addr.String(), header)
 		break
 	case FileListRequest:
 		header = "FLIST"
 		break
+	case ChunkRegisterRequest:
+		//CHREG fileid chunkid chunksize
+		header = fmt.Sprintf("CHREG %s",header)
+		break
 	}
 	message := fmt.Sprintf("%s\r\n%s", header, string(payload))
 	fmt.Println("sending", string(message))
-	_, err := p.w.Write([]byte(message))
+	_, err := p.conn.Write([]byte(message))
 	if err != nil {
-		return err
+		log.Println(err)
 	}
 	err = p.w.Flush()
+	if err!=nil{
+		log.Println(err)
+	}
 	return nil
 }
 
 func (p *Peer) readShareFile(filepath string) {
 	f, err := os.Open(filepath)
 	if err != nil {
-		log.Fatalf("unable to read file: %v", err)
+		log.Printf("unable to read file: %v", err)
+		return
 	}
 	defer f.Close()
 	fstat, _ := f.Stat()
 	message := fmt.Sprintf("%s %s", getFileName(filepath), strconv.Itoa(int(fstat.Size())))
 	buf := make([]byte, maxBufferSize)
 	p.SendMessage(RegisterRequest, message, []byte(""))
+	fmt.Println("here")
+	body, err := p.r.ReadBytes('\n')
+	fmt.Println("here")
+	if err!=nil{
+		log.Println(err)
+	}
+	fileid:=bytes.Split(body,[]byte(" "))[1]
+	fmt.Println("GOT fileid",fileid)
 	i := 0
 	for {
 		n, err := f.Read(buf)
@@ -121,14 +140,14 @@ func (p *Peer) readShareFile(filepath string) {
 			continue
 		}
 		println(i, n, buf)
-		i += 1
 		if n > 0 {
-			content := fmt.Sprintf("%s %d", getFileName(filepath), n)
-			err = p.SendMessage(FileChunkRequest, content, buf[:n])
+			content := fmt.Sprintf("%d %d %d", fileid, i, n)
+			err = p.SendMessage(ChunkRegisterRequest, content, buf[:n])
 			if err != nil {
 				fmt.Println(err)
 				break
 			}
+			i += 1
 		} else {
 			break
 		}
@@ -137,59 +156,37 @@ func (p *Peer) readShareFile(filepath string) {
 }
 
 func getFileName(path string) string { return filepath.Base(path) }
-func main() {
-	args := os.Args[1:]
-	var selfPeer Peer = Peer{}
-	selfPeer.addr = net.TCPAddr{IP: net.ParseIP(args[0])}
-	port, err := strconv.Atoi(args[1])
+
+func NewPeer(ip string,portStr string) (*Peer,error){
+	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		fmt.Println("Can't use port", port)
+		return nil,err
 	}
-	selfPeer.addr.Port = port
 	conn, err := net.Dial("tcp", serverIP+":"+serverPort)
 	if err != nil {
 		fmt.Printf("Server is not online - %v\n", err)
-		return
+		return nil,err
 	}
-	selfPeer.conn = conn
-	selfPeer.w = bufio.NewWriter(conn)
-	selfPeer.r = bufio.NewReader(conn)
-	fmt.Println(selfPeer.addr.IP.String())
-	if len(args) >= 3 {
-		i := 2
-
-		for _, file := range args[i:] {
-			selfPeer.readShareFile(file)
-		}
-	}
-	reader := bufio.NewScanner(os.Stdin)
-	displayHelpPrompt()
-	printRepl()
-	for reader.Scan() {
-		text := strings.Fields(stripInput(reader.Text()))
-		switch text[0] {
-		case "help":
-			displayHelpPrompt()
-		case "download":
-			downloadFile(text[1])
-		case "list":
-			selfPeer.listFiles()
-		case "progress":
-			displayProgress()
-		case "upload":
-			selfPeer.readShareFile(text[1])
-		default:
-			printUnknown(text[0])
-		}
-
-		printRepl()
-	}
-
+	return &Peer{
+		addr: net.TCPAddr{
+			IP: net.ParseIP(ip),
+			Port:port,
+		},
+		conn:conn,
+		w:bufio.NewWriter(conn),
+		r:bufio.NewReader(conn),
+	},nil
 }
-
 // ./peer/peer1/peer localhost 8001 peer/peer1/a.txt peer/peer1/sample.txt
 
-func downloadFile(file string) {}
+func (p *Peer) downloadFile(file string) {
+	//request chunks, peerid to addr
+}
+
+func sendChunk(peer *Peer){
+
+}
 
 func (p *Peer) listFiles() {
 	//make a FileList request to server
@@ -201,7 +198,7 @@ func (p *Peer) listFiles() {
 	if err != nil {
 		fmt.Println(err)
 	}
-	//fmt.Println("got response:",string(header),"bodY:",string(body))
+	fmt.Println("got response:","bodY:",string(body))
 	bodySplit := bytes.Split(body, []byte(" "))
 	bodySplit = bodySplit[:len(bodySplit)-1]
 
@@ -254,4 +251,61 @@ func displayProgress() {
 		}()
 	}
 	p.Wait()
+}
+
+func (peer *Peer) handleChunkRequests(conn net.Conn){
+	defer wg.Done()
+}
+
+func (peer *Peer) listenForPeerRequests(){
+	listener, err := net.Listen("tcp", peer.addr.String())
+	if err!=nil{
+		log.Println("Cannot send chunks from this peer")
+	}
+	for {
+		conn, err := listener.Accept()
+		fmt.Println("new client")
+		if err != nil {
+			fmt.Println("Error connecting:", err.Error())
+		}
+		wg.Add(1)
+		go peer.handleChunkRequests(conn)
+	}
+}
+
+
+func main() {
+	args := os.Args[1:]
+	selfPeer,err := NewPeer(args[0],args[1]) 
+	if err!=nil{
+		return
+	}
+	if len(args) >= 3 {
+		i := 2
+		for _, file := range args[i:] {
+			selfPeer.readShareFile(file)
+		}
+	}
+	reader := bufio.NewScanner(os.Stdin)
+	displayHelpPrompt()
+	go selfPeer.listenForPeerRequests()
+	printRepl()
+	for reader.Scan() {
+		text := strings.Fields(stripInput(reader.Text()))
+		switch text[0] {
+		case "help":
+			displayHelpPrompt()
+		case "download":
+			selfPeer.downloadFile(text[1])
+		case "list":
+			selfPeer.listFiles()
+		case "progress":
+			displayProgress()
+		case "upload":
+			selfPeer.readShareFile(text[1])
+		default:
+			printUnknown(text[0])
+		}
+		printRepl()
+	}
 }
