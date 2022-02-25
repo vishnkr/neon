@@ -39,7 +39,7 @@ REGCH <file-id>:<chunk-id>:length of message\r\n file content
 //const maxBufferSize = 2048
 
 type Message struct {
-	reqType RequestType
+	reqType ProtocolMessageType
 	sender  string
 	body    []byte
 }
@@ -80,10 +80,16 @@ type RequestData struct{
 	PayloadSize int `json:"payload_size,omitempty"`
 	ChunkId int `json:"chunk_id,omitempty"`
 }
+type MessageType int
+const (
+	RequestMessage MessageType = iota
+	ResponseMessage
+)
 
 //all the properties don't have to be set/ varies between request types
 type HeaderData struct{
-	cmd RequestType
+	mtype MessageType
+	cmd ProtocolMessageType
 	fileId int 
 	fname string
 	payloadSize int
@@ -125,13 +131,15 @@ func getPayload(payloadSize int, client *Client)([]byte,error){
 }
 
 func (s *Server) extractHeader(header []byte) (HeaderData) {
-	headerData := HeaderData{cmd:NoneType}
+	headerData := HeaderData{}
 	headerSplit := bytes.Split(header, []byte(" "))
 	fmt.Println("----Received Header:", string(header))
+	mtype,_ :=strconv.Atoi(string(bytes.TrimSpace(headerSplit[1])))
+	headerData.mtype = MessageType(mtype)
 	switch string(bytes.TrimSpace(headerSplit[0])) {
 	case "REG":
-		fname := string(bytes.TrimSpace(headerSplit[2]))
-		fsize, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[3])))
+		fname := string(bytes.TrimSpace(headerSplit[3]))
+		fsize, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[4])))
 		newFid := s.fileCount
 		s.fileMap[newFid] = &FileInfo{fileID:newFid,fname: fname, sizeInBytes: fsize}
 		s.fileNametoId[fname]=newFid
@@ -140,9 +148,9 @@ func (s *Server) extractHeader(header []byte) (HeaderData) {
 		headerData.cmd = RegisterRequest
 		headerData.fileId = newFid
 	case "FCHNK":
-		fname := string(bytes.TrimSpace(headerSplit[2]))
-		chunkSize, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[3])))
-		fmt.Println("filename", fname, "has chunk size", string(headerSplit[3]))
+		fname := string(bytes.TrimSpace(headerSplit[3]))
+		chunkSize, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[4])))
+		fmt.Println("filename", fname, "has chunk size", string(headerSplit[4]))
 		headerData.cmd = FileChunkRequest
 		headerData.fileId=s.fileMap[s.fileNametoId[fname]].fileID
 		headerData.payloadSize = chunkSize
@@ -150,9 +158,9 @@ func (s *Server) extractHeader(header []byte) (HeaderData) {
 		headerData.cmd = FileListRequest
 	case "CHREG":
 		//CHREG fileid chunkid chunksize
-		fileId, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[1])))
-		chunkId, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[2])))
-		chunkSize, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[3])))
+		fileId, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[2])))
+		chunkId, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[3])))
+		chunkSize, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[4])))
 		headerData.cmd = ChunkRegisterRequest
 		headerData.fileId = fileId
 		headerData.chunkId = chunkId
@@ -164,6 +172,7 @@ func (s *Server) extractHeader(header []byte) (HeaderData) {
 
 func (s Server) sendResponse(client *Client, message []byte) {
 	client.conn.Write(message)
+	fmt.Println("wrote response",message)
 }
 
 func (s Server) handleMessage(client *Client, header HeaderData) {
@@ -172,8 +181,10 @@ func (s Server) handleMessage(client *Client, header HeaderData) {
 	if err!=nil{
 		log.Println(err)
 	}
+	if header.mtype == ResponseMessage{
+		return
+	}
 	switch cmd {
-	
 	case RegisterRequest:
 		response:=fmt.Sprintf("REG %d",header.fileId)
 		fmt.Println("sending response",response)

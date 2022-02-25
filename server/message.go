@@ -1,9 +1,9 @@
 package main
 
-type RequestType int
+type ProtocolMessageType int
 
 const (
-	RegisterRequest RequestType = iota //REGISTER file
+	RegisterRequest ProtocolMessageType = iota //REGISTER file
 	FileListRequest //get list of files
 	FileLocationsRequest // locations of chunks:chunkid for file
 	ChunkRegisterRequest //

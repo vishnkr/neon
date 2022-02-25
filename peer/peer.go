@@ -28,8 +28,8 @@ type Peer struct {
 	addr       net.TCPAddr
 	conn       net.Conn
 	fileChunks *ChunkStore
-	w          *bufio.Writer
-	r          *bufio.Reader
+	writer          *bufio.Writer
+	reader          *bufio.Reader
 	sync.Mutex
 }
 
@@ -44,8 +44,13 @@ type Chunk struct {
 	data    []byte
 }
 
-type RequestType int
+type MessageType int
+const (
+	RequestMessage MessageType = iota
+	ResponseMessage
+)
 
+type RequestType int
 const (
 	RegisterRequest RequestType = iota
 	FileContentRequest
@@ -84,17 +89,17 @@ func stripInput(txt string) string {
 func (p *Peer) SendMessage(rType RequestType, header string, payload []byte) error {
 	switch rType {
 	case RegisterRequest:
-		header = fmt.Sprintf("REG %s %s", p.addr.String(), header)
+		header = fmt.Sprintf("REG %d %s %s",RequestMessage, p.addr.String(), header)
 		break
 	case FileChunkRequest:
-		header = fmt.Sprintf("FCHNK %s %s", p.addr.String(), header)
+		header = fmt.Sprintf("FCHNK %d %s %s", RequestMessage,p.addr.String(), header)
 		break
 	case FileListRequest:
-		header = "FLIST"
+		header = fmt.Sprintf("FLIST %d", RequestMessage)
 		break
 	case ChunkRegisterRequest:
 		//CHREG fileid chunkid chunksize
-		header = fmt.Sprintf("CHREG %s",header)
+		header = fmt.Sprintf("CHREG %d %s",RequestMessage, header)
 		break
 	}
 	message := fmt.Sprintf("%s\r\n%s", header, string(payload))
@@ -103,7 +108,7 @@ func (p *Peer) SendMessage(rType RequestType, header string, payload []byte) err
 	if err != nil {
 		log.Println(err)
 	}
-	err = p.w.Flush()
+	err = p.writer.Flush()
 	if err!=nil{
 		log.Println(err)
 	}
@@ -121,13 +126,16 @@ func (p *Peer) readShareFile(filepath string) {
 	message := fmt.Sprintf("%s %s", getFileName(filepath), strconv.Itoa(int(fstat.Size())))
 	buf := make([]byte, maxBufferSize)
 	p.SendMessage(RegisterRequest, message, []byte(""))
-	fmt.Println("here")
-	body, err := p.r.ReadBytes('\n')
-	fmt.Println("here")
+	fmt.Println("here1")
+	//_, _, err = p.reader.ReadLine()
+	//body,_, err := p.reader.ReadLine()
+	mess, err := bufio.NewReader(p.conn).ReadString('\n')
+    fmt.Print("Message from server: "+mess)
+	fmt.Println("here2")
 	if err!=nil{
-		log.Println(err)
+		panic(err)
 	}
-	fileid:=bytes.Split(body,[]byte(" "))[1]
+	fileid:=bytes.Split([]byte(mess),[]byte(" "))[1]
 	fmt.Println("GOT fileid",fileid)
 	i := 0
 	for {
@@ -174,8 +182,8 @@ func NewPeer(ip string,portStr string) (*Peer,error){
 			Port:port,
 		},
 		conn:conn,
-		w:bufio.NewWriter(conn),
-		r:bufio.NewReader(conn),
+		writer:bufio.NewWriter(conn),
+		reader:bufio.NewReader(conn),
 	},nil
 }
 // ./peer/peer1/peer localhost 8001 peer/peer1/a.txt peer/peer1/sample.txt
@@ -193,12 +201,12 @@ func (p *Peer) listFiles() {
 	writer := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', tabwriter.AlignRight)
 	p.SendMessage(FileListRequest, "", []byte(""))
 	//read response from buffer terminated by \n into buffered reader
-	_, _, err := p.r.ReadLine()
-	body, _, err := p.r.ReadLine()
+	_, _, err := p.reader.ReadLine()
+	body, _, err := p.reader.ReadLine()
 	if err != nil {
 		fmt.Println(err)
 	}
-	fmt.Println("got response:","bodY:",string(body))
+	fmt.Println("got response body:",string(body))
 	bodySplit := bytes.Split(body, []byte(" "))
 	bodySplit = bodySplit[:len(bodySplit)-1]
 
