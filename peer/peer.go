@@ -2,11 +2,11 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 
 	//"ioutil"
 
+	"encoding/json"
 	"io"
 	"log"
 	"math/rand"
@@ -28,9 +28,11 @@ type Peer struct {
 	addr       net.TCPAddr
 	conn       net.Conn
 	fileChunks *ChunkStore
-	w          *bufio.Writer
-	r          *bufio.Reader
+	writer          *bufio.Writer
+	reader          *bufio.Reader
 	sync.Mutex
+	decoder *json.Decoder
+	encoder *json.Encoder
 }
 
 type ChunkStore struct {
@@ -44,16 +46,35 @@ type Chunk struct {
 	data    []byte
 }
 
-type RequestType int
-
+type MessageType string
 const (
-	RegisterRequest RequestType = iota
-	FileContentRequest
-	FileListRequest
-	FileLocationsRequest
-	ChunkRegisterRequest
-	FileChunkRequest
+	RequestMessage MessageType = "Request"
+	ResponseMessage MessageType = "Response"
 )
+
+
+type RequestType int
+const (
+	Register RequestType = iota
+	FileContent
+	FileList
+	FileLocations
+	ChunkRegister
+	FileChunk
+)
+
+type JSONMessage struct{
+	Mtype MessageType `json:"message_type"`
+	Rtype RequestType `json:"req_type"`
+	Addr string `json:"addr"`
+	File string `json:"file,omitempty"`
+	FileSize int `json:"file_size,omitempty"`
+	FileId int `json:"file_id,omitempty"`
+	ChunkSize int `json:"chunk_size,omitempty"`
+	ChunkId int `json:"chunk_id,omitempty"`
+	Body string `json:"body,omitempty"`
+}
+
 
 const (
 	serverIP      = "127.0.0.1"
@@ -81,20 +102,24 @@ func stripInput(txt string) string {
 	return output
 }
 
-func (p *Peer) SendMessage(rType RequestType, header string, payload []byte) error {
+func (p *Peer) SendMessage(message JSONMessage){//rType RequestType, header string, payload []byte) error {
+	if err := p.encoder.Encode(message); err != nil {
+		fmt.Println("Encode error: ", err)
+	}
+	/*
 	switch rType {
-	case RegisterRequest:
-		header = fmt.Sprintf("REG %s %s", p.addr.String(), header)
+	case Register:
+		header = fmt.Sprintf("REG %d %s %s",RequestMessage, p.addr.String(), header)
 		break
-	case FileChunkRequest:
-		header = fmt.Sprintf("FCHNK %s %s", p.addr.String(), header)
+	case FileChunk:
+		header = fmt.Sprintf("FCHNK %d %s %s", RequestMessage,p.addr.String(), header)
 		break
-	case FileListRequest:
-		header = "FLIST"
+	case FileList:
+		header = fmt.Sprintf("FLIST %d", RequestMessage)
 		break
-	case ChunkRegisterRequest:
+	case ChunkRegister:
 		//CHREG fileid chunkid chunksize
-		header = fmt.Sprintf("CHREG %s",header)
+		header = fmt.Sprintf("CHREG %d %s",RequestMessage, header)
 		break
 	}
 	message := fmt.Sprintf("%s\r\n%s", header, string(payload))
@@ -103,11 +128,11 @@ func (p *Peer) SendMessage(rType RequestType, header string, payload []byte) err
 	if err != nil {
 		log.Println(err)
 	}
-	err = p.w.Flush()
+	err = p.writer.Flush()
 	if err!=nil{
 		log.Println(err)
 	}
-	return nil
+	return nil*/
 }
 
 func (p *Peer) readShareFile(filepath string) {
@@ -118,18 +143,30 @@ func (p *Peer) readShareFile(filepath string) {
 	}
 	defer f.Close()
 	fstat, _ := f.Stat()
-	message := fmt.Sprintf("%s %s", getFileName(filepath), strconv.Itoa(int(fstat.Size())))
+	//message := fmt.Sprintf("%s %s", getFileName(filepath), strconv.Itoa(int(fstat.Size())))
 	buf := make([]byte, maxBufferSize)
-	p.SendMessage(RegisterRequest, message, []byte(""))
-	fmt.Println("here")
-	body, err := p.r.ReadBytes('\n')
-	fmt.Println("here")
-	if err!=nil{
-		log.Println(err)
+	//p.SendMessage(Register, message, []byte(""))
+	message:= JSONMessage{
+		Mtype: RequestMessage,
+		Rtype: Register,
+		File: getFileName(filepath),
+		FileSize: int(fstat.Size()),
+		Addr: p.addr.String(),
 	}
-	fileid:=bytes.Split(body,[]byte(" "))[1]
-	fmt.Println("GOT fileid",fileid)
-	i := 0
+	if err := p.encoder.Encode(message); err != nil {
+		fmt.Println("Encode error: ", err)
+	}
+	var resp JSONMessage
+	fmt.Println("req:",message) 
+	p.decoder.Decode(&resp)
+	fmt.Println("resp:",resp)
+	if err!=nil{
+		panic(err)
+	}
+	//fileid:=0
+	//fileid:=bytes.Split([]byte("4"),[]byte(" "))[1]
+	//fmt.Println("GOT fileid",fileid)
+	chunkId := 0
 	for {
 		n, err := f.Read(buf)
 		if err == io.EOF {
@@ -139,15 +176,15 @@ func (p *Peer) readShareFile(filepath string) {
 			fmt.Println(err)
 			continue
 		}
-		println(i, n, buf)
+		//println(i, n, buf)
 		if n > 0 {
-			content := fmt.Sprintf("%d %d %d", fileid, i, n)
-			err = p.SendMessage(ChunkRegisterRequest, content, buf[:n])
-			if err != nil {
-				fmt.Println(err)
-				break
-			}
-			i += 1
+			message.Rtype = ChunkRegister
+			message.ChunkId = chunkId
+			message.Body = string(buf[:n])
+			message.ChunkSize = n
+			p.SendMessage(message)
+			
+			chunkId += 1
 		} else {
 			break
 		}
@@ -174,8 +211,10 @@ func NewPeer(ip string,portStr string) (*Peer,error){
 			Port:port,
 		},
 		conn:conn,
-		w:bufio.NewWriter(conn),
-		r:bufio.NewReader(conn),
+		//riter:bufio.NewWriter(conn),
+		//reader:bufio.NewReader(conn),
+		decoder: json.NewDecoder(conn),
+		encoder: json.NewEncoder(conn),
 	},nil
 }
 // ./peer/peer1/peer localhost 8001 peer/peer1/a.txt peer/peer1/sample.txt
@@ -191,27 +230,36 @@ func sendChunk(peer *Peer){
 func (p *Peer) listFiles() {
 	//make a FileList request to server
 	writer := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', tabwriter.AlignRight)
-	p.SendMessage(FileListRequest, "", []byte(""))
+	req := JSONMessage{
+		Mtype: RequestMessage,
+		Rtype: FileList,
+	}
+	p.SendMessage(req)
 	//read response from buffer terminated by \n into buffered reader
-	_, _, err := p.r.ReadLine()
-	body, _, err := p.r.ReadLine()
+	/*_, _, err := p.reader.ReadLine()
+	body, _, err := p.reader.ReadLine()
 	if err != nil {
 		fmt.Println(err)
+	}*/
+	message:=&JSONMessage{}
+	err := p.decoder.Decode(message)
+	if err!=nil{
+		fmt.Println("Docoding error",err)
 	}
-	fmt.Println("got response:","bodY:",string(body))
-	bodySplit := bytes.Split(body, []byte(" "))
-	bodySplit = bodySplit[:len(bodySplit)-1]
-
-	if len(bodySplit) == 0 {
+	if message.Body == "" {
 		fmt.Println("No files present in the network")
 		return
 	}
-	fmt.Println("Files present in the network:", len(bodySplit))
+	splitFn := func(c rune) bool {
+        return c == ' '
+	}
+	bodySplit := strings.FieldsFunc(message.Body,splitFn)//Split(message.Body," ")
+	fmt.Println("Files present in the network:", len(bodySplit),message)
 	fmt.Fprintln(writer, "FileID\tFilename\tSize(in bytes)")
-	for _, filedata := range bodySplit {
-		filedata = bytes.Trim(filedata, "")
-		if len(filedata) > 0 {
-			fileId, fName, size := bytes.Split(filedata, []byte(":"))[0], bytes.Split(filedata, []byte(":"))[1], bytes.Split(filedata, []byte(":"))[2]
+	for _, fileData := range bodySplit {
+		split:=strings.Split(fileData,":")
+		if len(split) > 0 {
+			fileId, fName, size := split[0], split[1], split[2]
 			displayStr := fmt.Sprintf("%s\t%s\t%s", string(fileId), string(fName), string(size))
 			fmt.Fprintln(writer, displayStr)
 		}
