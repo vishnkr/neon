@@ -2,15 +2,10 @@
 build:
 	go build -o server ./server
 	go build -o peer ./peer
-run_server:
+run:
 	./server/server
-
-run_peer:
-	./peer/peer
 
 clean:
 	go clean
-	rm peer/peer1/peer
-	rm peer/peer2/peer
+	rm peer/peer
 	rm server/server
-	rm brown.txt
