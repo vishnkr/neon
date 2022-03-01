@@ -269,7 +269,7 @@ func (peer *Peer) reconstructFile(fileChunks *FileChunks,totalChunks int){
 	}
 }
 
-func (peer *Peer) getChunkFromPeer(addr string,fileId int,chunkId int,fileChunks *FileChunks)error{//,initiatedDownloads map[string]bool) error{
+func (peer *Peer) getChunkFromPeer(addr string,fileId int,chunkId int,fileChunks *FileChunks) error{
 	var request JSONMessage = JSONMessage{
 		Mtype: RequestMessage,
 		Rtype: FileChunk,
@@ -282,7 +282,6 @@ func (peer *Peer) getChunkFromPeer(addr string,fileId int,chunkId int,fileChunks
 		return err
 	}
 	var response JSONMessage
-	//initiatedDownloads[addr]=true
 	encoder,decoder := json.NewEncoder(conn), json.NewDecoder(conn)
 	if err := encoder.Encode(request); err != nil {
 		fmt.Println("Encode error: ", err)
