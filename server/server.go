@@ -2,48 +2,25 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"net"
-	"strconv"
 	"sync"
 )
 
-/*
+type RequestType int
+const (
+	Register RequestType = iota
+	FileContent
+	FileList
+	FileLocations
+	ChunkRegister
+	FileChunk
+)
 
-Sample Message Format:
-
-Register Request:
-REG 127.0.0.1:8001\r\n a.txt 54\r\n
-
-Register Response:
-REG OK (maybe a client id for future use here) \r\n
-
-Modify later after multiple peers come into play
-
-Chunk send Request:
-REGCH 127.0.0.1:8001 a.txt 54\r\n [payload with size 54]\r\n
-
-Chunk send Response:
-REGCH OK \r\n
-Old:
-Register Request - REG 127.8.0.1:8001 2 a.txt\r\n
-filchunk - REGCH a.txt 43\r\n123123123123123123123123123123\r\n
-Register Response - REG RS\r\n a.txt SUC <file-id>
-Register Response - REG RS\r\n audio.mps FAIL
-REGCH <file-id>:<chunk-id>:length of message\r\n file content
-*/
-//const maxBufferSize = 2048
-
-type Message struct {
-	reqType RequestType
-	sender  string
-	body    []byte
-}
-type FileChunk struct {
+type FileChunkInfo struct {
 	content []byte
 	fileID  int
 	chunkID int
@@ -65,7 +42,9 @@ type Client struct {
 	reader   *bufio.Reader
 	addr     net.Addr
 	register chan<- *Client
-	d *json.Decoder
+	decoder *json.Decoder
+	encoder *json.Encoder
+	mu sync.Mutex
 }
 type Server struct {
 	clients   map[int]*Client
@@ -73,171 +52,172 @@ type Server struct {
 	fileNametoId map[string]int
 	fileCount int
 }
-
-type RequestData struct{
+type JSONMessage struct{
+	Mtype MessageType `json:"message_type"`
+	Rtype RequestType `json:"req_type"`
+	Addr string `json:"addr"`
+	File string `json:"file,omitempty"`
+	FileSize int `json:"file_size,omitempty"`
 	FileId int `json:"file_id,omitempty"`
-	Fname string `json:"file_name,omitempty"`
-	PayloadSize int `json:"payload_size,omitempty"`
+	ChunkSize int `json:"chunk_size,omitempty"`
 	ChunkId int `json:"chunk_id,omitempty"`
+	Body []byte `json:"body,omitempty"`
+	Status ResponseStatus `json:"status,omitempty"`
 }
 
-//all the properties don't have to be set/ varies between request types
-type HeaderData struct{
-	cmd RequestType
-	fileId int 
-	fname string
-	payloadSize int
-	chunkId int
-}
+type ResponseStatus int 
+const (
+	Success ResponseStatus = iota
+	Err
+)
+
+type MessageType string
+const (
+	RequestMessage MessageType = "Request"
+	ResponseMessage MessageType = "Response"
+)
+
+/*
+ChunksLocations: {1:["127.0.9.0:2344","128.0.9.0:1111"],2:["56.13.87.90"]}
+
+*/
+
+type FileLocation struct{
+	FileId int `json:"file_id"`
+	TotalChunks int `json:"total_chunks"`
+	ChunkLocations map[int][]string `json:"chunk_locations"`
+} 
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer wg.Done()
-	client := &Client{id: len(s.clients) + 1, conn: conn, d : json.NewDecoder(conn)}
+	client := &Client{
+		id: len(s.clients) + 1, 
+		conn: conn, 
+		addr: conn.RemoteAddr(),
+		decoder : json.NewDecoder(conn),
+		encoder : json.NewEncoder(conn),
+	}
+	fmt.Println("Client id:",client.id,"has joined -",client.addr.String())
 	r := bufio.NewReader(conn)
 	client.reader = r
 	s.clients[client.id] = client
-	i := 0
 	for {
-		fmt.Println("Loop:", i)
-		header, err := client.reader.ReadBytes('\n')
-		fmt.Println("Parsing header", string(header), len(header), string(header))
-
-		headerData := s.extractHeader(header)
-		//fmt.Println("got cmd", cmd, "file", s.getFileNameFromId(fileId), payloadSize)
-		s.handleMessage(client,headerData)
+		var jsonReq JSONMessage
+		err := client.decoder.Decode(&jsonReq)
+		if err != nil {
+			return
+		}
+		fmt.Println(jsonReq)
+		s.handleMessage(client,jsonReq)
 		if err != nil {
 			fmt.Println("error", err)
 			break
 		}
-		i += 1
 
 	}
 }
 
-func getPayload(payloadSize int, client *Client)([]byte,error){
-	readBuf := make([]byte, payloadSize)
-	n, err := client.reader.Read(readBuf)
-	fmt.Printf("--------BUFFER START------\n%d:%s-------BUFFER END------\n", n, string(readBuf))
-	if err!=nil{
-		return nil,err
-	}
-	return readBuf,nil
+func (s *Server) sendResponse(client *Client, resp JSONMessage) {
+	client.encoder.Encode(resp)
+	fmt.Println("wrote response",resp.Addr,resp.Mtype,resp.Rtype,resp.ChunkId,resp.ChunkSize,resp.FileId)
 }
 
-func (s *Server) extractHeader(header []byte) (HeaderData) {
-	headerData := HeaderData{cmd:NoneType}
-	headerSplit := bytes.Split(header, []byte(" "))
-	fmt.Println("----Received Header:", string(header))
-	switch string(bytes.TrimSpace(headerSplit[0])) {
-	case "REG":
-		fname := string(bytes.TrimSpace(headerSplit[2]))
-		fsize, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[3])))
-		newFid := s.fileCount
-		s.fileMap[newFid] = &FileInfo{fileID:newFid,fname: fname, sizeInBytes: fsize}
-		s.fileNametoId[fname]=newFid
-		s.fileCount += 1
-		fmt.Println("---New fileMap---", s.fileMap[newFid], s.fileCount, s.fileMap)
-		headerData.cmd = RegisterRequest
-		headerData.fileId = newFid
-	case "FCHNK":
-		fname := string(bytes.TrimSpace(headerSplit[2]))
-		chunkSize, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[3])))
-		fmt.Println("filename", fname, "has chunk size", string(headerSplit[3]))
-		headerData.cmd = FileChunkRequest
-		headerData.fileId=s.fileMap[s.fileNametoId[fname]].fileID
-		headerData.payloadSize = chunkSize
-	case "FLIST":
-		headerData.cmd = FileListRequest
-	case "CHREG":
-		//CHREG fileid chunkid chunksize
-		fileId, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[1])))
-		chunkId, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[2])))
-		chunkSize, _ := strconv.Atoi(string(bytes.TrimSpace(headerSplit[3])))
-		headerData.cmd = ChunkRegisterRequest
-		headerData.fileId = fileId
-		headerData.chunkId = chunkId
-		headerData.payloadSize = chunkSize
+func (s *Server) handleMessage(client *Client, req JSONMessage) {
+	cmd := req.Rtype
+	if req.Mtype == ResponseMessage{
+		return
 	}
-
-	return headerData
-}
-
-func (s Server) sendResponse(client *Client, message []byte) {
-	client.conn.Write(message)
-}
-
-func (s Server) handleMessage(client *Client, header HeaderData) {
-	cmd,payloadSize := header.cmd, header.payloadSize
-	readBuf,err:=getPayload(payloadSize,client)
-	if err!=nil{
-		log.Println(err)
-	}
+	fmt.Println("got cmd",cmd)
 	switch cmd {
-	
-	case RegisterRequest:
-		response:=fmt.Sprintf("REG %d",header.fileId)
-		fmt.Println("sending response",response)
-		s.sendResponse(client,[]byte(response))
-
-	case FileChunkRequest:
-		/*
-			totalRead := 0
-			f, err := os.OpenFile(s.getFileNameFromId(fileId),os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err != nil {
-				log.Println(err)
-			}
-			defer f.Close()
-			for totalRead<payloadSize{
-				content:= readBuf[:n]
-				totalRead+=n
-				fmt.Println("cont",string(content),s.getFileNameFromId(fileId))
-				if _, err := f.Write(content); err != nil {
-					log.Println(err)
-				}
-				fmt.Println("buffer after regch: ",totalRead,payloadSize)
-				n, _ = reader.Read(readBuf)
-				if n==0{
-					break
-				}
-			}*/
-	case FileListRequest:
-		response := fmt.Sprintf("FLIST %d\r\n", len(s.fileMap))
-		for _, file := range s.fileMap {
-			response += fmt.Sprintf("%d:%s:%d ", file.fileID, file.fname, file.sizeInBytes)
+	case Register:
+		newFid := s.fileCount
+		s.fileMap[newFid] = &FileInfo{
+			fileID:newFid,
+			fname: req.File, 
+			sizeInBytes: req.FileSize,
+			chunkLocations: make(map[int][]*Client),
+			totalChunks: 0,
 		}
-		log.Print("sending flist:", response)
-		s.sendResponse(client, []byte(response+"\r\n"))
+		s.fileNametoId[req.File]=newFid
+		s.fileCount += 1
+		req.Mtype = ResponseMessage
+		req.FileId = newFid
+		s.sendResponse(client,req)
+	case FileList:
+		response:=""
+		for id, file := range s.fileMap {
+			response += fmt.Sprintf("%d:%s:%d ", id, file.fname, file.sizeInBytes)
+		}
+		var resp JSONMessage = JSONMessage{Mtype: ResponseMessage, Rtype: FileList,Body : []byte(response)}
+		log.Print("sending flist:", resp)
+		s.sendResponse(client,resp)
 	
-	case ChunkRegisterRequest:
-		s.handleChunkRegister(header,readBuf)
+	case ChunkRegister:
+
+		newclient:=s.getClientWithLowestChunks()
+		fmt.Println("newclient",newclient.conn.RemoteAddr().String())
+		req.Addr = newclient.addr.String()
+		s.sendChunkReceiverData(client,newclient,req)
+
+	case FileLocations:
+		var response JSONMessage = JSONMessage{
+			Mtype: ResponseMessage,
+			Rtype: FileLocations,
+		}
+		fileInfo,ok:= s.fileMap[req.FileId] 
+		if !ok{
+			response.Status = Err 
+			s.sendResponse(client,response)
+			return
+		}
+		fileLocations := FileLocation{
+			FileId: req.FileId,
+			TotalChunks: fileInfo.totalChunks,
+			ChunkLocations: s.getChunkLocationMap(fileInfo),
+		}
+		body,err := json.Marshal(fileLocations)
+		if err!=nil{
+			fmt.Println("Marshal error")
+		}
+		fmt.Println("file locations body",string(body))
+		response.Body = body
+		s.sendResponse(client,response)
+		
 	}
 }
 
-func (s *Server) handleChunkRegister(header HeaderData,payload []byte,){
-	fchunk:= FileChunk{
-		fileID: header.fileId,
-		content: payload,
-		chunkID: header.chunkId,
-		chunkSize: header.payloadSize,
+func (s *Server) getChunkLocationMap(fileInfo *FileInfo) map[int][]string{
+	locations:= make(map[int][]string)
+	chunkId:=0
+	for chunkId < fileInfo.totalChunks{
+		chunkLocations:= []string{}
+		for _,peer := range(fileInfo.chunkLocations[chunkId]){
+			chunkLocations = append(chunkLocations, peer.addr.String())
+		}
+		locations[chunkId] = chunkLocations
+		chunkId+=1
+		
 	}
-	client:=s.getClientWithLowestChunks()
-	s.sendChunkReceiverData(client,&fchunk)
+	fmt.Println("Final chunk locations for file",locations)
+	return locations
 }
-
-func (s *Server) sendChunkReceiverData(client *Client, fileChunk *FileChunk) {
-	//REGGCHNK fileid chunkid chunksize\r\npayload\r\n
-	fileId,chunkId:=fileChunk.fileID,fileChunk.chunkID
-	message:=fmt.Sprintf("CHREG %d %d %d\r\n",fileId,chunkId,fileChunk.chunkSize)
-	s.sendResponse(client,[]byte(message))
-	client.chunksStored+=1
-	s.fileMap[fileId].chunkLocations[chunkId] = append(s.fileMap[fileId].chunkLocations[chunkId],client)
+func (s *Server) sendChunkReceiverData(client *Client,newclient *Client, message JSONMessage){// fileChunk *FileChunkInfo) {
+	client.mu.Lock()
+	defer client.mu.Unlock() 
+	fileId,chunkId:=message.FileId, message.ChunkId
+	newclient.chunksStored+=1
+	s.fileMap[fileId].chunkLocations[chunkId] = append(s.fileMap[fileId].chunkLocations[chunkId],newclient)
 	s.fileMap[fileId].totalChunks+=1
+	fmt.Println("chunk send to",newclient.id,newclient.addr.String())
+	message.Mtype=ResponseMessage
+	s.sendResponse(client,message)
 }
 
 func (s *Server) getClientWithLowestChunks() *Client{
 	var minClient *Client
 	minChunks := math.MaxInt32
 	for _,c := range s.clients{
+		fmt.Println("client:",c.id,"chunks:",c.chunksStored)
 		if c.chunksStored<minChunks{ 
 			minChunks = c.chunksStored
 			minClient = c
@@ -246,9 +226,7 @@ func (s *Server) getClientWithLowestChunks() *Client{
 	return minClient
 }
 
-func decodeJson(){
 
-}
 var wg sync.WaitGroup
 
 const (
@@ -267,7 +245,6 @@ func main() {
 	}
 	for {
 		conn, err := listener.Accept()
-		fmt.Println("new client")
 		if err != nil {
 			fmt.Println("Error connecting:", err.Error())
 		}

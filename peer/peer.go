@@ -2,18 +2,18 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
+	"strconv"
 
 	//"ioutil"
 
+	"encoding/json"
 	"io"
 	"log"
 	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -25,16 +25,22 @@ import (
 
 type Peer struct {
 	peerId     int
-	addr       net.TCPAddr
+	addr       net.Addr
 	conn       net.Conn
-	fileChunks *ChunkStore
-	w          *bufio.Writer
-	r          *bufio.Reader
-	sync.Mutex
+	chunkStore *ChunkStore
+	mu sync.Mutex
+	decoder *json.Decoder
+	encoder *json.Encoder
 }
 
 type ChunkStore struct {
-	fileToChunkId map[int][]int
+	fileChunks map[int]*FileChunks //map file id to filechunk struct
+	chunksStored int //for verification purposes
+}
+
+type FileChunks struct{
+	chunks map[int]*Chunk //map chunk id to actual chunk
+	mu sync.Mutex
 }
 
 type Chunk struct {
@@ -44,22 +50,52 @@ type Chunk struct {
 	data    []byte
 }
 
-type RequestType int
+type FileLocation struct{
+	FileId int `json:"file_id"`
+	TotalChunks int `json:"total_chunks"`
+	ChunkLocations map[int][]string `json:"chunk_locations"`
+} 
 
+type MessageType string
 const (
-	RegisterRequest RequestType = iota
-	FileContentRequest
-	FileListRequest
-	FileLocationsRequest
-	ChunkRegisterRequest
-	FileChunkRequest
+	RequestMessage MessageType = "Request"
+	ResponseMessage MessageType = "Response"
+)
+
+
+type RequestType int
+const (
+	Register RequestType = iota
+	FileContent
+	FileList
+	FileLocations
+	ChunkRegister
+	FileChunk
+)
+
+type JSONMessage struct{
+	Mtype MessageType `json:"message_type"`
+	Rtype RequestType `json:"req_type"`
+	Addr string `json:"addr"`
+	File string `json:"file,omitempty"`
+	FileSize int `json:"file_size,omitempty"`
+	FileId int `json:"file_id,omitempty"`
+	ChunkSize int `json:"chunk_size,omitempty"`
+	ChunkId int `json:"chunk_id,omitempty"`
+	Body []byte `json:"body,omitempty"`
+	Status ResponseStatus `json:"status,omitempty"`
+}
+type ResponseStatus int 
+const (
+	Success ResponseStatus = iota
+	Err
 )
 
 const (
 	serverIP      = "127.0.0.1"
 	serverPort    = "8080"
-	maxBufferSize = 1048576
-	maxChunkSize  = 1048576 //1MB
+	maxBufferSize = 8192//1048576
+	maxChunkSize  = 8192//1048576 //1MB
 )
 
 var wg sync.WaitGroup
@@ -81,33 +117,16 @@ func stripInput(txt string) string {
 	return output
 }
 
-func (p *Peer) SendMessage(rType RequestType, header string, payload []byte) error {
-	switch rType {
-	case RegisterRequest:
-		header = fmt.Sprintf("REG %s %s", p.addr.String(), header)
-		break
-	case FileChunkRequest:
-		header = fmt.Sprintf("FCHNK %s %s", p.addr.String(), header)
-		break
-	case FileListRequest:
-		header = "FLIST"
-		break
-	case ChunkRegisterRequest:
-		//CHREG fileid chunkid chunksize
-		header = fmt.Sprintf("CHREG %s",header)
-		break
+func (p *Peer) SendMessage(message JSONMessage){//rType RequestType, header string, payload []byte) error {
+	if err := p.encoder.Encode(message); err != nil {
+		fmt.Println("Encode error: ", err)
 	}
-	message := fmt.Sprintf("%s\r\n%s", header, string(payload))
-	fmt.Println("sending", string(message))
-	_, err := p.conn.Write([]byte(message))
-	if err != nil {
-		log.Println(err)
+}
+
+func (p *Peer) ReceiveMessage(response *JSONMessage){
+	if err:= p.decoder.Decode(&response); err!=nil{
+		fmt.Println("Server response decode error",err)
 	}
-	err = p.w.Flush()
-	if err!=nil{
-		log.Println(err)
-	}
-	return nil
 }
 
 func (p *Peer) readShareFile(filepath string) {
@@ -118,18 +137,25 @@ func (p *Peer) readShareFile(filepath string) {
 	}
 	defer f.Close()
 	fstat, _ := f.Stat()
-	message := fmt.Sprintf("%s %s", getFileName(filepath), strconv.Itoa(int(fstat.Size())))
 	buf := make([]byte, maxBufferSize)
-	p.SendMessage(RegisterRequest, message, []byte(""))
-	fmt.Println("here")
-	body, err := p.r.ReadBytes('\n')
-	fmt.Println("here")
-	if err!=nil{
-		log.Println(err)
+	message:= JSONMessage{
+		Mtype: RequestMessage,
+		Rtype: Register,
+		File: getFileName(filepath),
+		FileSize: int(fstat.Size()),
+		Addr: p.addr.String(),
 	}
-	fileid:=bytes.Split(body,[]byte(" "))[1]
-	fmt.Println("GOT fileid",fileid)
-	i := 0
+	if err := p.encoder.Encode(message); err != nil {
+		fmt.Println("Encode error: ", err)
+	}
+	var resp JSONMessage
+	//fmt.Println("req:",message) 
+	p.decoder.Decode(&resp)
+	//fmt.Println("resp:",resp)
+	if err!=nil{
+		panic(err)
+	}
+	chunkId := 0
 	for {
 		n, err := f.Read(buf)
 		if err == io.EOF {
@@ -139,15 +165,23 @@ func (p *Peer) readShareFile(filepath string) {
 			fmt.Println(err)
 			continue
 		}
-		println(i, n, buf)
+
 		if n > 0 {
-			content := fmt.Sprintf("%d %d %d", fileid, i, n)
-			err = p.SendMessage(ChunkRegisterRequest, content, buf[:n])
-			if err != nil {
-				fmt.Println(err)
-				break
+			message.Rtype = ChunkRegister
+			message.ChunkId = chunkId
+			message.Body = buf[:n]
+			message.ChunkSize = n
+			p.SendMessage(message)
+			var response JSONMessage
+			p.ReceiveMessage(&response)
+			//fmt.Println("got response",response)
+			if response.Addr==p.addr.String(){
+				fmt.Println("storing chunk in self")
+				p.storeChunk(message)
+			} else{
+				p.sendPeerMessage(response,response.Addr)
 			}
-			i += 1
+			chunkId += 1
 		} else {
 			break
 		}
@@ -157,61 +191,162 @@ func (p *Peer) readShareFile(filepath string) {
 
 func getFileName(path string) string { return filepath.Base(path) }
 
-func NewPeer(ip string,portStr string) (*Peer,error){
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		fmt.Println("Can't use port", port)
-		return nil,err
-	}
+func NewPeer() (*Peer,error){
 	conn, err := net.Dial("tcp", serverIP+":"+serverPort)
 	if err != nil {
 		fmt.Printf("Server is not online - %v\n", err)
 		return nil,err
 	}
+	fmt.Println("HI MY ADDRESS IS",conn.LocalAddr().String())
 	return &Peer{
-		addr: net.TCPAddr{
-			IP: net.ParseIP(ip),
-			Port:port,
-		},
+		addr: conn.LocalAddr(),
+		chunkStore: &ChunkStore{fileChunks: make(map[int]*FileChunks),chunksStored: 0},
 		conn:conn,
-		w:bufio.NewWriter(conn),
-		r:bufio.NewReader(conn),
+		decoder: json.NewDecoder(conn),
+		encoder: json.NewEncoder(conn),
 	},nil
 }
-// ./peer/peer1/peer localhost 8001 peer/peer1/a.txt peer/peer1/sample.txt
 
-func (p *Peer) downloadFile(file string) {
+func (p *Peer) downloadFile(fileId int) {
 	//request chunks, peerid to addr
+	//var downloadwg sync.WaitGroup
+	var fileLocReq JSONMessage = JSONMessage{
+		Mtype: RequestMessage,
+		Rtype: FileLocations,
+		FileId: fileId,
+	}
+	p.SendMessage(fileLocReq)
+	var fileLocRes JSONMessage
+	var fileLocations FileLocation
+	p.ReceiveMessage(&fileLocRes)
+	if fileLocRes.Status==Success{
+		json.Unmarshal(fileLocRes.Body,&fileLocations)
+		fmt.Println("got file locations",fileLocations)
+	} else {
+		fmt.Println("Couldn't get file location")
+		return 
+	}
+	initiatedDownloads:=make(map[string]bool)
+	fileChunks := FileChunks{chunks:make(map[int]*Chunk)}
+	// for each chunk spawn a go routine that makes a peer request  with file chunk request
+	// once number of received chunks is equal to total chunks for the file, reconstruct the file and save it
+	for chunkid:=0;chunkid<fileLocations.TotalChunks;chunkid+=1{
+		for _,peerAddr:= range(fileLocations.ChunkLocations[chunkid]){
+			if val,ok:=initiatedDownloads[peerAddr]; ok&&val{
+				continue
+			}
+			//if you hold the required chunk just add it to file chunks otherwise initiate request
+			initiatedDownloads[peerAddr]=true
+			p.getChunkFromPeer(peerAddr,fileId,chunkid,&fileChunks)
+			initiatedDownloads[peerAddr]=false
+			break
+		}
+	} 
+	p.reconstructFile(&fileChunks,fileLocations.TotalChunks)
 }
 
-func sendChunk(peer *Peer){
+func (peer *Peer) reconstructFile(fileChunks *FileChunks,totalChunks int){
+	f, err := os.OpenFile("download.txt",os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err!=nil{
+		log.Println(err)
+	}
+	defer f.Close()
+	fmt.Println("filechunks",fileChunks.chunks,totalChunks)
+	for chunkId:=0;chunkId<totalChunks;chunkId+=1{
+		var content []byte = fileChunks.chunks[chunkId].data
+		if _, err := f.Write(content); err != nil {
+			log.Println("write err",err)
+		}
+	}
+}
 
+func (peer *Peer) getChunkFromPeer(addr string,fileId int,chunkId int,fileChunks *FileChunks) error{
+	var request JSONMessage = JSONMessage{
+		Mtype: RequestMessage,
+		Rtype: FileChunk,
+		FileId: fileId,
+		ChunkId: chunkId,
+	}
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		fmt.Printf("Peer is not online - %v\n", err)
+		return err
+	}
+	var response JSONMessage
+	encoder,decoder := json.NewEncoder(conn), json.NewDecoder(conn)
+	if err := encoder.Encode(request); err != nil {
+		fmt.Println("Encode error: ", err)
+		return err
+	}
+	if err:= decoder.Decode(&response); err!=nil{
+		fmt.Println("Encode error: ", err)
+		return err
+	}
+	fmt.Printf("got chunk from peer: %+v\n",response)
+	fileChunks.chunks[chunkId]=&Chunk{data:response.Body}
+	return nil
+}
+
+func (peer *Peer) sendPeerMessage(message JSONMessage,addr string)error{
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		fmt.Printf("Peer is not online - %v\n", err)
+		return err
+	}
+	encoder:= json.NewEncoder(conn)
+	if err := encoder.Encode(message); err != nil {
+		fmt.Println("Encode error: ", err)
+	}
+	return nil
+}
+
+func (peer *Peer) storeChunk(message JSONMessage) bool{
+	if _,ok:= peer.chunkStore.fileChunks[message.FileId]; !ok{ //peer doesn't have any chunks from this file
+		peer.chunkStore.fileChunks[message.FileId] = &FileChunks{chunks:make(map[int]*Chunk)}
+	}
+	
+	
+	peer.chunkStore.fileChunks[message.FileId].chunks[message.ChunkId] = &Chunk{
+		fileId: message.FileId,
+		size: message.ChunkSize,
+		chunkId: message.ChunkId,
+		data: message.Body,
+	}
+	peer.chunkStore.chunksStored+=1
+	//fmt.Println(string(peer.chunkStore.fileChunks[message.FileId].chunks[message.ChunkId].data))
+	fmt.Println("got chunk with size",message.ChunkSize,"id:",message.ChunkId)
+	fmt.Println("CHUNKS STORED:",peer.chunkStore.chunksStored)
+	printRepl()
+	return true
 }
 
 func (p *Peer) listFiles() {
 	//make a FileList request to server
 	writer := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', tabwriter.AlignRight)
-	p.SendMessage(FileListRequest, "", []byte(""))
-	//read response from buffer terminated by \n into buffered reader
-	_, _, err := p.r.ReadLine()
-	body, _, err := p.r.ReadLine()
-	if err != nil {
-		fmt.Println(err)
+	req := JSONMessage{
+		Mtype: RequestMessage,
+		Rtype: FileList,
 	}
-	fmt.Println("got response:","bodY:",string(body))
-	bodySplit := bytes.Split(body, []byte(" "))
-	bodySplit = bodySplit[:len(bodySplit)-1]
-
-	if len(bodySplit) == 0 {
+	p.SendMessage(req)
+	message:=&JSONMessage{}
+	err := p.decoder.Decode(message)
+	if err!=nil{
+		fmt.Println("Docoding error",err)
+	}
+	if string(message.Body) == "" {
 		fmt.Println("No files present in the network")
 		return
 	}
-	fmt.Println("Files present in the network:", len(bodySplit))
+	splitFn := func(c rune) bool {
+        return c == ' '
+	}
+	bodySplit := strings.FieldsFunc(string(message.Body),splitFn)
+	fmt.Println("Files present in the network:", len(bodySplit),message)
 	fmt.Fprintln(writer, "FileID\tFilename\tSize(in bytes)")
-	for _, filedata := range bodySplit {
-		filedata = bytes.Trim(filedata, "")
-		if len(filedata) > 0 {
-			fileId, fName, size := bytes.Split(filedata, []byte(":"))[0], bytes.Split(filedata, []byte(":"))[1], bytes.Split(filedata, []byte(":"))[2]
+	for _, fileData := range bodySplit {
+		split:=strings.Split(fileData,":")
+		if len(split) > 0 {
+			fileId, fName, size := split[0], split[1], split[2]
 			displayStr := fmt.Sprintf("%s\t%s\t%s", string(fileId), string(fName), string(size))
 			fmt.Fprintln(writer, displayStr)
 		}
@@ -220,7 +355,7 @@ func (p *Peer) listFiles() {
 
 }
 
-func displayProgress() {
+func (peer *Peer) displayProgress() {
 	var wg sync.WaitGroup
 	p := mpb.New(mpb.WithWaitGroup(&wg))
 	var total int64 = 100
@@ -253,35 +388,77 @@ func displayProgress() {
 	p.Wait()
 }
 
-func (peer *Peer) handleChunkRequests(conn net.Conn){
+func (peer *Peer) handleChunkRequests(conn net.Conn,message JSONMessage){
 	defer wg.Done()
+	switch message.Rtype{
+	case ChunkRegister:
+		success:= peer.storeChunk(message)
+		if success{
+			response:= &JSONMessage{
+				Mtype: ResponseMessage,
+				Rtype: ChunkRegister,
+				Status:Success,
+				FileId: message.FileId,
+				ChunkId: message.ChunkId,
+			}
+			json.NewEncoder(conn).Encode(response)
+		}
+	case FileChunk:
+		response:= &JSONMessage{
+			Mtype: ResponseMessage,
+			Rtype: FileChunk,
+			Status:Success,
+		}
+		fileid,chunkid:= message.FileId,message.ChunkId
+		fileChunks,ok:=peer.chunkStore.fileChunks[fileid]
+		if !ok{
+			fmt.Println("no file found")
+			response.Status = Err
+		} else{
+			chunk,ok:=fileChunks.chunks[chunkid]
+			if !ok{ 
+				fmt.Println("no chunk found")
+				response.Status = Err
+			} else {
+				fmt.Println("sending body",string(chunk.data))
+				printRepl()
+				response.Body = chunk.data
+			}
+		}
+		json.NewEncoder(conn).Encode(response)
+	}
 }
 
 func (peer *Peer) listenForPeerRequests(){
 	listener, err := net.Listen("tcp", peer.addr.String())
 	if err!=nil{
-		log.Println("Cannot send chunks from this peer")
+		log.Fatalf("Cannot send/receive chunks from this peer\n")
 	}
 	for {
 		conn, err := listener.Accept()
-		fmt.Println("new client")
+		fmt.Println("new peer")
 		if err != nil {
 			fmt.Println("Error connecting:", err.Error())
 		}
 		wg.Add(1)
-		go peer.handleChunkRequests(conn)
+		decoder := json.NewDecoder(conn)
+		var message JSONMessage
+		if err := decoder.Decode(&message);err!=nil{
+			log.Println("error decoding peer message")
+		}
+		go peer.handleChunkRequests(conn,message)
 	}
 }
 
 
 func main() {
-	args := os.Args[1:]
-	selfPeer,err := NewPeer(args[0],args[1]) 
+	selfPeer,err := NewPeer() 
 	if err!=nil{
 		return
 	}
-	if len(args) >= 3 {
-		i := 2
+	args := os.Args
+	if len(args) > 1 {
+		i := 1
 		for _, file := range args[i:] {
 			selfPeer.readShareFile(file)
 		}
@@ -296,11 +473,22 @@ func main() {
 		case "help":
 			displayHelpPrompt()
 		case "download":
-			selfPeer.downloadFile(text[1])
+			if len(text)>2{ 
+				fmt.Println("Cannot download more than 1 file")
+				printRepl()
+				continue
+			}
+			file_id,err := strconv.Atoi(text[1])
+			if err!=nil{
+				fmt.Println("Invalid file ID")
+				printRepl()
+				continue
+			}
+			selfPeer.downloadFile(file_id)
 		case "list":
 			selfPeer.listFiles()
 		case "progress":
-			displayProgress()
+			selfPeer.displayProgress()
 		case "upload":
 			selfPeer.readShareFile(text[1])
 		default:

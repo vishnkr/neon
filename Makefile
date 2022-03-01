@@ -2,11 +2,8 @@
 build:
 	go build -o server ./server
 	go build -o peer ./peer
-run_server:
+run:
 	./server/server
-
-run_peer:
-	./peer/peer
 
 clean:
 	go clean
