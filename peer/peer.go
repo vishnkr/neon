@@ -2,18 +2,15 @@ package main
 
 import (
 	"bufio"
-	"fmt"
-	"strconv"
-
-	//"ioutil"
-
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -208,7 +205,7 @@ func NewPeer() (*Peer,error){
 	},nil
 }
 
-func (p *Peer) downloadFile(fileId int) {
+func (p *Peer) downloadFile(fileId int,downloadPath string) {
 	//request chunks, peerid to addr
 	var downloadWg sync.WaitGroup
 	var fileLocReq JSONMessage = JSONMessage{
@@ -233,15 +230,12 @@ func (p *Peer) downloadFile(fileId int) {
 	for chunkid:=0;chunkid<fileLocations.TotalChunks;chunkid+=1{
 		for _,peerAddr:= range(fileLocations.ChunkLocations[chunkid]){
 			//if you hold the required chunk just add it to file chunks otherwise initiate request
-			fmt.Println("chunkid 1",chunkid)
 			if peerAddr == p.addr.String(){
 				fileChunks.chunks[chunkid] = &Chunk{data: p.chunkStore.fileChunks[fileId].chunks[chunkid].data}
 			} else {
 				downloadWg.Add(1)
-				fmt.Println("chunkid 2",chunkid)
 				x:=chunkid //x is the new local closed over value
 				go func(id int){
-					fmt.Println("chunkid 3",chunkid)
 					defer downloadWg.Done()
 					p.getChunkFromPeer(peerAddr,fileId,x,&fileChunks)
 				}(chunkid)
@@ -250,17 +244,16 @@ func (p *Peer) downloadFile(fileId int) {
 		}
 	} 
 	downloadWg.Wait()
-	fmt.Println(fileChunks.chunks)
-	p.reconstructFile(&fileChunks,fileLocations.TotalChunks)
+	p.reconstructFile(&fileChunks,fileLocations.TotalChunks,downloadPath)
 }
 
-func (peer *Peer) reconstructFile(fileChunks *FileChunks,totalChunks int){
-	f, err := os.OpenFile("download.txt",os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err!=nil{
-		log.Println(err)
+func (peer *Peer) reconstructFile(fileChunks *FileChunks,totalChunks int,downloadPath string){
+	if err:= os.MkdirAll(filepath.Dir(downloadPath),0770);err!=nil{
+		fmt.Println("error making folder")
+		return
 	}
+	f,_ := os.Create(downloadPath)
 	defer f.Close()
-	fmt.Println("filechunks",fileChunks.chunks,totalChunks)
 	for chunkId:=0;chunkId<totalChunks;chunkId+=1{
 		var content []byte = fileChunks.chunks[chunkId].data
 		if _, err := f.Write(content); err != nil {
@@ -291,8 +284,6 @@ func (peer *Peer) getChunkFromPeer(addr string,fileId int,chunkId int,fileChunks
 		fmt.Println("Encode error: ", err)
 		return err
 	}
-	fmt.Printf("got chunk from peer: %+v\n",response)
-	//initiatedDownloads[addr]=false
 	fileChunks.chunks[chunkId]=&Chunk{data:response.Body,fileId: fileId, chunkId: chunkId}
 	return nil
 }
@@ -314,8 +305,6 @@ func (peer *Peer) storeChunk(message JSONMessage) bool{
 	if _,ok:= peer.chunkStore.fileChunks[message.FileId]; !ok{ //peer doesn't have any chunks from this file
 		peer.chunkStore.fileChunks[message.FileId] = &FileChunks{chunks:make(map[int]*Chunk)}
 	}
-	
-	
 	peer.chunkStore.fileChunks[message.FileId].chunks[message.ChunkId] = &Chunk{
 		fileId: message.FileId,
 		size: message.ChunkSize,
@@ -323,7 +312,6 @@ func (peer *Peer) storeChunk(message JSONMessage) bool{
 		data: message.Body,
 	}
 	peer.chunkStore.chunksStored+=1
-	//fmt.Println(string(peer.chunkStore.fileChunks[message.FileId].chunks[message.ChunkId].data))
 	fmt.Println("got chunk with size",message.ChunkSize,"id:",message.ChunkId)
 	fmt.Println("CHUNKS STORED:",peer.chunkStore.chunksStored)
 	printRepl()
@@ -430,8 +418,6 @@ func (peer *Peer) handleChunkRequests(conn net.Conn,message JSONMessage){
 				fmt.Println("no chunk found")
 				response.Status = Err
 			} else {
-				fmt.Println("sending body",string(chunk.data))
-				printRepl()
 				response.Body = chunk.data
 			}
 		}
@@ -446,7 +432,6 @@ func (peer *Peer) listenForPeerRequests(){
 	}
 	for {
 		conn, err := listener.Accept()
-		fmt.Println("new peer")
 		if err != nil {
 			fmt.Println("Error connecting:", err.Error())
 		}
@@ -483,7 +468,7 @@ func main() {
 		case "help":
 			displayHelpPrompt()
 		case "download":
-			if len(text)>2{ 
+			if len(text)>3{ 
 				fmt.Println("Cannot download more than 1 file")
 				printRepl()
 				continue
@@ -494,7 +479,7 @@ func main() {
 				printRepl()
 				continue
 			}
-			selfPeer.downloadFile(file_id)
+			selfPeer.downloadFile(file_id,text[2])
 		case "list":
 			selfPeer.listFiles()
 		case "progress":
