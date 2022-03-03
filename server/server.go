@@ -13,7 +13,6 @@ import (
 type RequestType int
 const (
 	Register RequestType = iota
-	FileContent
 	FileList
 	FileLocations
 	ChunkRegister
@@ -31,8 +30,12 @@ type FileInfo struct {
 	fileID         int
 	fname          string
 	sizeInBytes    int
-	totalChunks    int               //chunks 0 to totalChunks-1 will be present as keys in chunkLocations
-	chunkLocations map[int][]*Client //map chunkid to list of clients containing
+	 //chunks 0 to totalChunks-1 will be present as keys in chunkLocations
+	totalChunks    int              
+	 //map chunkid to list of clients containing
+	chunkLocations map[int][]*Client
+	//SHA256 hash of entire file
+	fileHash []byte
 }
 
 type Client struct {
@@ -77,19 +80,14 @@ const (
 	ResponseMessage MessageType = "Response"
 )
 
-/*
-ChunksLocations: {1:["127.0.9.0:2344","128.0.9.0:1111"],2:["56.13.87.90"]}
-
-*/
-
 type FileLocation struct{
 	FileId int `json:"file_id"`
 	TotalChunks int `json:"total_chunks"`
 	ChunkLocations map[int][]string `json:"chunk_locations"`
+	FileHash []byte `json:"file_hash"`
 } 
 
 func (s *Server) handleConn(conn net.Conn) {
-	defer wg.Done()
 	client := &Client{
 		id: len(s.clients) + 1, 
 		conn: conn, 
@@ -107,7 +105,6 @@ func (s *Server) handleConn(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		fmt.Println(jsonReq)
 		s.handleMessage(client,jsonReq)
 		if err != nil {
 			fmt.Println("error", err)
@@ -127,7 +124,6 @@ func (s *Server) handleMessage(client *Client, req JSONMessage) {
 	if req.Mtype == ResponseMessage{
 		return
 	}
-	fmt.Println("got cmd",cmd)
 	switch cmd {
 	case Register:
 		newFid := s.fileCount
@@ -137,25 +133,22 @@ func (s *Server) handleMessage(client *Client, req JSONMessage) {
 			sizeInBytes: req.FileSize,
 			chunkLocations: make(map[int][]*Client),
 			totalChunks: 0,
+			fileHash: req.Body,
 		}
 		s.fileNametoId[req.File]=newFid
 		s.fileCount += 1
-		req.Mtype = ResponseMessage
-		req.FileId = newFid
-		s.sendResponse(client,req)
+		var response JSONMessage = JSONMessage{Mtype: ResponseMessage, Rtype: Register, FileId: newFid, Status: Success}
+		client.encoder.Encode(response)
 	case FileList:
 		response:=""
 		for id, file := range s.fileMap {
 			response += fmt.Sprintf("%d:%s:%d ", id, file.fname, file.sizeInBytes)
 		}
 		var resp JSONMessage = JSONMessage{Mtype: ResponseMessage, Rtype: FileList,Body : []byte(response)}
-		log.Print("sending flist:", resp)
-		s.sendResponse(client,resp)
+		client.encoder.Encode(resp)
 	
 	case ChunkRegister:
-
 		newclient:=s.getClientWithLowestChunks()
-		fmt.Println("newclient",newclient.conn.RemoteAddr().String())
 		req.Addr = newclient.addr.String()
 		s.sendChunkReceiverData(client,newclient,req)
 
@@ -167,26 +160,27 @@ func (s *Server) handleMessage(client *Client, req JSONMessage) {
 		fileInfo,ok:= s.fileMap[req.FileId] 
 		if !ok{
 			response.Status = Err 
-			s.sendResponse(client,response)
+			client.encoder.Encode(response)
 			return
 		}
 		fileLocations := FileLocation{
 			FileId: req.FileId,
 			TotalChunks: fileInfo.totalChunks,
 			ChunkLocations: s.getChunkLocationMap(fileInfo),
+			FileHash: s.fileMap[req.FileId].fileHash,
 		}
 		body,err := json.Marshal(fileLocations)
 		if err!=nil{
 			fmt.Println("Marshal error")
 		}
-		fmt.Println("file locations body",string(body))
 		response.Body = body
-		s.sendResponse(client,response)
+		client.encoder.Encode(response)
 		
 	}
 }
-
+//getChunkLocationMap: organizes chunk locations of each file chunk into a map that can be easily encoded into JSON
 func (s *Server) getChunkLocationMap(fileInfo *FileInfo) map[int][]string{
+	//map stores key value pairs of chunk id and a list of string addresses of peers storing that chunk
 	locations:= make(map[int][]string)
 	chunkId:=0
 	for chunkId < fileInfo.totalChunks{
@@ -198,26 +192,26 @@ func (s *Server) getChunkLocationMap(fileInfo *FileInfo) map[int][]string{
 		chunkId+=1
 		
 	}
-	fmt.Println("Final chunk locations for file",locations)
 	return locations
 }
-func (s *Server) sendChunkReceiverData(client *Client,newclient *Client, message JSONMessage){// fileChunk *FileChunkInfo) {
+
+//sendChunkReceiverData: stores chunklocation for the newly registered chunk and responds to client
+func (s *Server) sendChunkReceiverData(client *Client,newclient *Client, message JSONMessage){
 	client.mu.Lock()
 	defer client.mu.Unlock() 
 	fileId,chunkId:=message.FileId, message.ChunkId
 	newclient.chunksStored+=1
 	s.fileMap[fileId].chunkLocations[chunkId] = append(s.fileMap[fileId].chunkLocations[chunkId],newclient)
 	s.fileMap[fileId].totalChunks+=1
-	fmt.Println("chunk send to",newclient.id,newclient.addr.String())
 	message.Mtype=ResponseMessage
-	s.sendResponse(client,message)
+	client.encoder.Encode(message)
 }
 
+//getClientWithLowestChunks: chunks are sent to clients with lowest chunks so that chunks are distributed equally
 func (s *Server) getClientWithLowestChunks() *Client{
 	var minClient *Client
 	minChunks := math.MaxInt32
 	for _,c := range s.clients{
-		fmt.Println("client:",c.id,"chunks:",c.chunksStored)
 		if c.chunksStored<minChunks{ 
 			minChunks = c.chunksStored
 			minClient = c
@@ -225,7 +219,6 @@ func (s *Server) getClientWithLowestChunks() *Client{
 	}
 	return minClient
 }
-
 
 var wg sync.WaitGroup
 
@@ -248,7 +241,6 @@ func main() {
 		if err != nil {
 			fmt.Println("Error connecting:", err.Error())
 		}
-		wg.Add(1)
 		go server.handleConn(conn)
 	}
 
